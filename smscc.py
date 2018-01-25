@@ -1,12 +1,11 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 #
-# SMS Control Center v0.1
 # (C)reated by MaxWolf 2015
 # Distributed under GPL, see https://gnu.org/licenses/gpl.html for details
-# $Id$
 #
-import os, sys, shutil, subprocess, re, getopt, logging, ConfigParser, fnmatch
+#
+import os, sys, shutil, subprocess, re, getopt, logging, ConfigParser, fnmatch, collections
 
 def print_err(*args):
     sys.stderr.write(' '.join(map(str,args)) + '\n')
@@ -21,9 +20,9 @@ class SMSCconfig:
         self.inMsgs = "/var/pool/gammu/inbox"
         self.inArc = "/var/spool/gammu/inbox-processed"
         self.sendCmd = "gammu-smsd-inject TEXT $N -unicode -len $L -text $T"
-        self.clients = {}
-        self.resources = {}
-        self.groups = {}
+        self.clients = collections.OrderedDict()
+        self.objects = collections.OrderedDict()
+        self.groups = collections.OrderedDict()
 
     def load(self, cfgFileName):
         try:
@@ -56,11 +55,12 @@ class SMSCconfig:
 
             sn = "clients"
             for phn, ar in config.items(sn):
+                logging.debug("Config item %s=%s" %(phn, ar))
                 self.clients[phn] = ar
 
-            sn = "resources"
+            sn = "objects"
             for rname, rvalue in config.items(sn):
-                if not self.parse_resource(rname, rvalue):
+                if not self.parse_object(rname, rvalue):
                     return False
 
             sn = "groups"
@@ -79,18 +79,18 @@ class SMSCconfig:
             logging.critical("Unexpected error:", sys.exc_info()[0])
             return False
 
-    def parse_resource(self, rname, rvalue):
-#        logging.debug("Resource=%s/%s" %(rname, rvalue))
-        rlist = rvalue.split(";")
+    def parse_object(self, rname, rvalue):
+        logging.debug("object=%s/%s" %(rname, rvalue))
+        rlist = rvalue.split(":")
         if len(rlist) != 4:
-            logging.critical("Invalid resource %s definition" %rname)
+            logging.critical("Invalid object %s definition" %rname)
             return False
-        self.resources[rname] = {}
-        self.resources[rname]["descr"] = rlist[0]
-        self.resources[rname]["ar"] = rlist[1]
-        self.resources[rname]["getter"] = rlist[2]
-        self.resources[rname]["setter"] = rlist[3]
-#        logging.debug("Resource %s parsed [%s][%s][%s]", rname, self.resources[rname]["descr"], self.resources[rname]["getter"], self.resources[rname]["setter"])
+        self.objects[rname] = {}
+        self.objects[rname]["descr"] = rlist[0]
+        self.objects[rname]["ar"] = rlist[1]
+        self.objects[rname]["getter"] = rlist[2]
+        self.objects[rname]["setter"] = rlist[3]
+        logging.debug("object %s parsed [%s][%s][%s][%s]", rname, self.objects[rname]["descr"], self.objects[rname]["ar"], self.objects[rname]["getter"], self.objects[rname]["setter"])
         return True
 
 
@@ -161,7 +161,7 @@ def check_sms(cfg, smsList):
     for s in smsList:
 #        logging.debug("SMS from %s (%s): [%s]" %(s["cid"], s["time"], s["text"]))
         for cli in cfg.clients.keys():
-#            logging.debug("Matching to %s" % cli)
+            logging.debug("Matching to %s" % cli)
             if re.match(cli, s["cid"]):
                 logging.info("CID %s Matched. AR=%s" %(s["cid"], cfg.clients[cli]))
                 logging.info("Message text [%s]" %s["text"])
@@ -229,12 +229,12 @@ def process_sms(sms, ar, cfg):
             logging.info("Processing group [%s]" %cname)
             glist = cfg.groups[cname].split(",")
             for k in glist:
-                reply += process_cmd(k, prm, query, descr, ar, cfg)
-        elif cname in cfg.resources.keys():
-            reply += process_cmd(cname, prm, query, descr, ar, cfg)
+                reply += process_cmd(k, prm, query, descr, noread, ar, cfg, True)
+        elif cname in cfg.objects.keys():
+            reply += process_cmd(cname, prm, query, descr, noread, ar, cfg, False)
         else:
             reply += "?" + cname + ";"
-            logging.warning("Unknown resource %s from cmd %s" %(cname, c))
+            logging.warning("Unknown object %s from cmd %s" %(cname, c))
 
 
     logging.info("Sending reply SMS to [%s]:[%s]" %(sms["cid"], reply))
@@ -256,56 +256,74 @@ def process_sms(sms, ar, cfg):
 
 
 def has_right(ar, target):
-    logging.debug("Checking [%s] for [%s]" %(ar, target))
+    logging.debug("Checking client rights [%s] for [%s]" %(ar, target))
     if len(target) == 0:
         return True
     for r in target[:]:
-        logging.debug("Check [%s] in [%s]" %(r, ar))
         if ar.find(r) != -1:
+            logging.debug("Right [%s] is in [%s] - passed" %(r, ar))
             return True
+        else:
+            logging.debug("Right [%s] is not in [%s]" %(r, ar))
+    logging.debug("Checking rights failed")
     return False
 
 
-def process_cmd(cname, prm, query, descr, ar, cfg):
+def process_cmd(cname, prm, query, descr, noread, ar, cfg, groupCmd):
     reply = ""
     cc = ""
-    if len(prm) != 0:
-        cc = cfg.resources[cname]["setter"]
-        if len(cc) == 0:
-            logging.error("No setter for cname %s configured" %cname)
-        else:
-            cc = re.sub(r"\$", prm, cc)
-            logging.info("For cname %s starting setter cmd [%s]" %(cname, cc))
-    elif query:
-        cc = cfg.resources[cname]["getter"]
-        logging.info("For cname %s starting query cmd [%s]" %(cname, cc))
 
-    if (len(cc) == 0) or ((len(prm) == 0) and (ar.find("R") == -1)) or ((len(prm) != 0) and (ar.find("W") == -1)) or not has_right(ar, cfg.resources[cname]["ar"]):
-        reply += "&" + cname + ";"
-        logging.error("Permission error of [%s]" %cname)
+    if query and (ar.find("R") == -1):
+        logging.error("Read permission error of [%s]" %cname)
+        return "?" + cname + ";"
+
+    if not query and (ar.find("W") == -1):
+        logging.error("Write permission error of [%s]" %cname)
+        return "?" + cname + ";"
+
+    if not has_right(ar, cfg.objects[cname]["ar"]):
+        logging.error("Group permission error of [%s]" %cname)
+        return "?" + cname + ";"
+
+    if not query:
+        cc = cfg.objects[cname]["setter"]
+        if len(cc) == 0:
+            logging.error("No setter for cname [%s] configured" %cname)
+            return "#" + cname + ";"
+        else:
+            logging.info("For cname %s setter cmd amended with [%s]" %(cname, prm))
+            cc = re.sub(r"\$", prm, cc)
     else:
-        try:
-            p = subprocess.Popen(cc, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, shell=True)
-            out, err = p.communicate()
-        except Exception, edescr:
-            logging.error("Cmd exception: %s" %edescr);
+        cc = cfg.objects[cname]["getter"]
+        if len(cc) == 0:
+            logging.error("No getter for cname [%s] configured" %cname)
+            return "#" + cname + ";"
+
+    logging.info("For cname %s starting %s cmd [%s]" %(cname, "getter" if query else "setter", cc))
+    try:
+        p = subprocess.Popen(cc, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, shell=True)
+        out, err = p.communicate()
+    except Exception, edescr:
+        logging.error("Cmd exception: %s" %edescr);
+        if descr:
+            reply += "%s(%s) - failed;" % (cfg.objects[cname]["descr"], cname)
+        else:
+            reply += "#" + cname + ";"
+    else:
+        logging.info("Cmd returned out=[%s] and err=[%s]" %(out, err))
+        if len(out) == 0 and len(err) != 0:
             if descr:
-                reply += "%s(%s) - failed;" % (cfg.resources[cname]["descr"], cname)
+                reply += "%s(%s) - error;" % (cfg.objects[cname]["descr"], cname)
             else:
                 reply += "#" + cname + ";"
         else:
-            logging.info("Cmd returned out=[%s] and err=[%s]" %(out, err))
-            if len(out) == 0 and len(err) != 0:
-                if descr:
-                    reply += "%s(%s) - error;" % (cfg.resources[cname]["descr"], cname)
-                else:
-                    reply += "#" + cname + ";"
+            if noread:
+                out="OK"
+            out = out.lstrip(" ?*$%#^\r\n").rstrip(" ?*$%#^\r\n")
+            if descr:
+                reply += "%s(%s)=%s;" % (cfg.objects[cname]["descr"], cname, out)
             else:
-                out = out.lstrip(" ?*$%#^\r\n").rstrip(" ?*$%#^\r\n")
-                if descr:
-                    reply += "%s(%s)=%s;" % (cfg.resources[cname]["descr"], cname, out)
-                else:
-                    reply += cname + "=" + out + ";"
+                reply += cname + "=" + out + ";"
     return reply
 
 def process_scan(c, ar, cfg):
@@ -314,14 +332,14 @@ def process_scan(c, ar, cfg):
         reply += "&" + c + ";"
         logging.error("Permission error of [%s]" %c)
     else:
-        logging.info("Processing resources scan [%s]" %c)
+        logging.info("Processing objects scan [%s]" %c)
         for n in cfg.groups.keys():
             if fnmatch.fnmatch(n, c):
                 reply += n + ":" + cfg.groups[n] + ";"
-        for n in cfg.resources.keys():
-            if has_right(ar, cfg.resources[n]["ar"]) and fnmatch.fnmatch(n, c):
-                reply += n + ":" + cfg.resources[n]["descr"]
-                if len(cfg.resources[n]["setter"]) != 0:
+        for n in cfg.objects.keys():
+            if has_right(ar, cfg.objects[n]["ar"]) and fnmatch.fnmatch(n, c):
+                reply += n + ":" + cfg.objects[n]["descr"]
+                if len(cfg.objects[n]["setter"]) != 0:
                     reply += "*;"
                 else:
                     reply += ";"
@@ -332,7 +350,7 @@ def process_scan(c, ar, cfg):
 #
 
 def usage(progName):
-    print_err(progName + ' --config=<configFile> --log=<logfile> --scan --test');
+    print_err(progName + ' --config=<configFile> --log=<logfile> [--scan] [--test] [--debug]');
 
 
 def main(argv):
@@ -342,7 +360,7 @@ def main(argv):
 #    logfileName = "/maxwolf/Projects/WirenBoard/smssrv/smscc.log"
 
     try:
-        opts, args = getopt.getopt(argv[1:],"hlcs",["log=", "config=","scan","test"])
+        opts, args = getopt.getopt(argv[1:],"hl:c:sd",["log=", "config=","scan","test","debug"])
     except getopt.GetoptError, e:
         print_err("Invalid options: " + e.msg)
         usage(argv[0])
@@ -350,6 +368,7 @@ def main(argv):
 
     scan = True
     test = False
+    debug = False
     for opt, arg in opts:
         if opt == '-h':
             usage(argv[0])
@@ -362,8 +381,10 @@ def main(argv):
             scan = 1
         elif opt in ("-t", "--test"):
             test = 1
+        elif opt in ("-d", "--debug"):
+            debug = 1
          
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s',
+    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
         filename=logfileName, filemode='a')
 
     logging.info('===== Starting SMSCC. Config file is ' + cfgFileName)
